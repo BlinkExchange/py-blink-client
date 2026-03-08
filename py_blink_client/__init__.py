@@ -1,6 +1,10 @@
 """Python client for the Blink Markets CLOB."""
 
 from .client import ClobClient, BlinkClobClient
+try:
+    from .async_client import AsyncClobClient
+except ImportError:
+    AsyncClobClient = None  # type: ignore[assignment,misc]
 from .types import (
     ApiCreds,
     BalanceAllowance,
@@ -41,6 +45,7 @@ from .constants import CONTRACTS, BASE_SEPOLIA_CHAIN_ID
 __all__ = [
     "ClobClient",
     "BlinkClobClient",
+    "AsyncClobClient",
     "ApiCreds",
     "BookParams",
     "CreateOrderOptions",

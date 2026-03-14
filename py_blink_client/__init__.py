@@ -40,6 +40,7 @@ from .exceptions import (
     BlinkWebSocketError,
     PolyApiException,
 )
+from .ws import BlinkMarketWs, BlinkPriceWs, BlinkUserWs
 from .constants import CONTRACTS, BASE_SEPOLIA_CHAIN_ID
 
 __all__ = [
@@ -77,6 +78,9 @@ __all__ = [
     "BlinkOrderError",
     "BlinkWebSocketError",
     "PolyApiException",
+    "BlinkMarketWs",
+    "BlinkPriceWs",
+    "BlinkUserWs",
     "CONTRACTS",
     "BASE_SEPOLIA_CHAIN_ID",
 ]

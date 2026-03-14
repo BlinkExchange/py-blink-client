@@ -14,6 +14,7 @@ dependencies = [
     "msgspec>=0.18,<1",
     "orjson>=3.9,<4",
     "eth-account>=0.13,<1",
+    "websockets>=13,<14",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -17,5 +17,16 @@ dependencies = [
     "websockets>=13,<14",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["py_blink_client"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

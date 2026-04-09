@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-blink-client"
-version = "0.1.0"
+version = "0.4.0"
 description = "Python client for the Blink Markets CLOB API"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [

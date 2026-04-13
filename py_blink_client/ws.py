@@ -1,4 +1,35 @@
-"""WebSocket clients for the Blink market, price, and user channels."""
+"""
+WebSocket clients for Blink Markets real-time data.
+
+Three WebSocket channels:
+  - ``BlinkMarketWs`` -- Public market data (``/ws/market``): orderbook
+    snapshots, deltas, trades, market events.
+  - ``BlinkPriceWs`` -- Public price ticks (``/ws/price``): Pyth oracle
+    price feeds.
+  - ``BlinkUserWs`` -- Authenticated user events (``/ws/user``): order
+    accepted/rejected, fills, cancellations, settlement, position changes.
+
+All use the ``websockets`` library (async) and run in a background thread
+so they can be used from synchronous code.
+
+Usage::
+
+    from py_blink_client import BlinkMarketWs, BlinkUserWs
+    from py_blink_client.types import ApiCreds
+
+    # Public market data
+    market_ws = BlinkMarketWs("wss://api.blink15.com")
+    market_ws.on_snapshot = lambda data: print("Snapshot:", data)
+    market_ws.on_trade = lambda data: print("Trade:", data)
+    market_ws.subscribe(["<token_id_hex_no_0x>"])
+    market_ws.start()
+
+    # Authenticated user events
+    creds = ApiCreds(api_key="...", api_secret="...", api_passphrase="...")
+    user_ws = BlinkUserWs("wss://api.blink15.com", creds)
+    user_ws.on_order_fill = lambda data: print("Fill:", data)
+    user_ws.start()
+"""
 from __future__ import annotations
 
 import asyncio
@@ -318,17 +349,23 @@ class BlinkMarketWs(_BaseWs):
     """Public market data WebSocket.
 
     Connects to ``/ws/market`` and dispatches orderbook snapshots,
-    trades, and market-status events.
+    orderbook deltas, trades, and market-status events.
 
-    asset_id values are lowercase hex without a ``0x`` prefix.
+    Notes:
+      - The server does NOT send a "connected" message on connect.
+      - asset_id values are lowercase hex WITHOUT 0x prefix.
+      - ``orderbook_delta`` and ``best_prices`` are defined in the protocol
+        but not currently emitted by the server.
+      - ``market_created`` and ``market_status`` are broadcast to ALL
+        clients regardless of subscription.
 
     Callbacks (set as attributes):
-        on_snapshot(data)
-        on_delta(data)
-        on_trade(data)
-        on_best_prices(data)
-        on_market_created(data)
-        on_market_status(data)
+        on_snapshot(data): Full orderbook snapshot.
+        on_delta(data): Incremental orderbook update (not currently emitted).
+        on_trade(data): Trade execution.
+        on_best_prices(data): Top-of-book update (not currently emitted).
+        on_market_created(data): New market available (broadcast to all).
+        on_market_status(data): Market status change (broadcast to all).
     """
 
     def __init__(self, base_url: str) -> None:
@@ -433,14 +470,15 @@ class BlinkMarketWs(_BaseWs):
 class BlinkPriceWs(_BaseWs):
     """Public price tick WebSocket.
 
-    Connects to ``/ws/price`` and dispatches underlying price ticks.
+    Connects to ``/ws/price`` and dispatches real-time Pyth oracle price
+    feeds.
 
     Notes:
-      - The server sends a ``connected`` message on connect.
+      - The server DOES send a ``connected`` message on connect.
       - Subscribe uses **symbols** (e.g. ``"AAPLX"``), not token IDs.
 
     Callbacks (set as attributes):
-        on_price_tick(data)
+        on_price_tick(data): Real-time price from Pyth oracle.
     """
 
     def __init__(self, base_url: str) -> None:
@@ -487,8 +525,17 @@ class BlinkPriceWs(_BaseWs):
 class BlinkUserWs(_BaseWs):
     """Authenticated user event WebSocket.
 
-    Connects to ``/ws/user``, authenticates with API credentials, and
-    dispatches per-user events (fills, cancellations, positions, PnL).
+    Connects to ``/ws/user``, authenticates via API credentials, and
+    dispatches user-specific events.
+
+    Notes:
+      - The server does NOT send a "connected" message on connect.
+      - Auth format: ``{"type": "user", "auth": {"api_key": ..., "secret": ..., "passphrase": ...}}``
+      - On success: ``{"type": "authenticated", "address": "0x..."}``
+      - On failure: ``{"type": "error", "code": "INVALID_CREDENTIALS", ...}``
+      - Connection stays open on auth failure (client can retry).
+      - After auth, server sends: wallet_status, balance_update,
+        orders_snapshot, positions_snapshot.
 
     Callbacks (set as attributes):
         on_order_accepted(data)
@@ -512,21 +559,13 @@ class BlinkUserWs(_BaseWs):
         self._creds = creds
         self._authenticated = False
 
-        # Event callbacks
-        self.on_order_accepted: Optional[Callback] = None
-        self.on_order_rejected: Optional[Callback] = None
-        self.on_order_fill: Optional[Callback] = None
-        self.on_order_cancelled: Optional[Callback] = None
-        self.on_settlement: Optional[Callback] = None
-        self.on_position_update: Optional[Callback] = None
-        self.on_redeemable_position: Optional[Callback] = None
-        self.on_pnl_update: Optional[Callback] = None
-        self.on_wallet_status: Optional[Callback] = None
-        self.on_balance_update: Optional[Callback] = None
-        self.on_orders_snapshot: Optional[Callback] = None
-        self.on_positions_snapshot: Optional[Callback] = None
+        # Event callbacks — unified event model
         self.on_authenticated: Optional[Callable[[], None]] = None
         self.on_auth_error: Optional[Callback] = None
+        self.on_state_changed: Optional[Callback] = None
+        self.on_notification: Optional[Callback] = None
+        self.on_wallet_status: Optional[Callback] = None
+        self.on_redeemable_position: Optional[Callback] = None
         self.on_activity_created: Optional[Callback] = None
 
     @property
@@ -541,8 +580,16 @@ class BlinkUserWs(_BaseWs):
         return self._authenticated
 
     async def _on_open(self, ws: Any) -> None:
-        """Send the auth envelope on connect."""
-        # reset so wait_for_auth() doesn't return stale True after reconnect
+        """Send auth message on connect.
+
+        Auth format per backend spec:
+        ``{"type": "user", "auth": {"api_key": "...", "secret": "...", "passphrase": "..."}}``
+
+        No HMAC signature needed -- the server validates api_key + passphrase
+        directly using constant-time comparison.
+        """
+        # Reset auth state so wait_for_auth() doesn't return stale True
+        # after a reconnect.
         self._authenticated = False
 
         auth_msg = json.dumps({
@@ -566,53 +613,25 @@ class BlinkUserWs(_BaseWs):
                 if self.on_authenticated:
                     self.on_authenticated()
 
-            elif event_type == "order_accepted":
-                if self.on_order_accepted:
-                    self.on_order_accepted(data)
+            elif event_type == "state_changed":
+                if self.on_state_changed:
+                    self.on_state_changed(data)
 
-            elif event_type == "order_rejected":
-                if self.on_order_rejected:
-                    self.on_order_rejected(data)
-
-            elif event_type == "order_fill":
-                if self.on_order_fill:
-                    self.on_order_fill(data)
-
-            elif event_type in ("order_cancelled", "order_cancelled_v2"):
-                if self.on_order_cancelled:
-                    self.on_order_cancelled(data)
-
-            elif event_type == "settlement":
-                if self.on_settlement:
-                    self.on_settlement(data)
-
-            elif event_type == "position_update":
-                if self.on_position_update:
-                    self.on_position_update(data)
-
-            elif event_type == "redeemable_position":
-                if self.on_redeemable_position:
-                    self.on_redeemable_position(data)
-
-            elif event_type == "pnl_update":
-                if self.on_pnl_update:
-                    self.on_pnl_update(data)
+            elif event_type == "notification":
+                if self.on_notification:
+                    self.on_notification(data)
 
             elif event_type == "wallet_status":
                 if self.on_wallet_status:
                     self.on_wallet_status(data)
 
-            elif event_type == "balance_update":
-                if self.on_balance_update:
-                    self.on_balance_update(data)
+            elif event_type == "redeemable_position":
+                if self.on_redeemable_position:
+                    self.on_redeemable_position(data)
 
-            elif event_type == "orders_snapshot":
-                if self.on_orders_snapshot:
-                    self.on_orders_snapshot(data)
-
-            elif event_type == "positions_snapshot":
-                if self.on_positions_snapshot:
-                    self.on_positions_snapshot(data)
+            elif event_type == "activity_created":
+                if self.on_activity_created:
+                    self.on_activity_created(data)
 
             elif event_type == "error":
                 code = data.get("code", "")
@@ -624,10 +643,6 @@ class BlinkUserWs(_BaseWs):
                         self.on_auth_error(data)
                 else:
                     logger.warning("User WS error [%s]: %s", code, msg)
-
-            elif event_type == "activity_created":
-                if self.on_activity_created:
-                    self.on_activity_created(data)
 
             elif event_type == "pong":
                 pass

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Smoke-test every SDK method against a live Blink backend."""
+"""
+Verify every Python SDK method against the live production Blink backend.
+
+Tests each method, records pass/fail/skip, and produces a full compatibility report.
+
+Usage:
+    cd py-blink-client
+    python3 examples/verify_backend.py
+"""
 from __future__ import annotations
 
 import asyncio
@@ -173,7 +181,7 @@ async def main():
     await v.check("get_fee_rate_bps(yes)", lambda: client.get_fee_rate_bps(yes_token))
 
     # ═══ Tick Data ═══
-    v.section("Tick Data")
+    v.section("Tick Data (Pyth)")
     await v.check("get_tick_backfill(SPYX)", lambda: client.get_tick_backfill("SPYX"))
     await v.check("get_price_stats(SPYX)", lambda: client.get_price_stats("SPYX"))
     await v.check("get_price_history(yes)", lambda: client.get_price_history(yes_token))

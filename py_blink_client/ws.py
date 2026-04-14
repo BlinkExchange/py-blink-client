@@ -3,11 +3,12 @@ WebSocket clients for Blink Markets real-time data.
 
 Three WebSocket channels:
   - ``BlinkMarketWs`` -- Public market data (``/ws/market``): orderbook
-    snapshots, deltas, trades, market events.
+    snapshots, trades, market-status events.
   - ``BlinkPriceWs`` -- Public price ticks (``/ws/price``): Pyth oracle
     price feeds.
-  - ``BlinkUserWs`` -- Authenticated user events (``/ws/user``): order
-    accepted/rejected, fills, cancellations, settlement, position changes.
+  - ``BlinkUserWs`` -- Authenticated user events (``/ws/user``): unified
+    ``state_changed`` + ``notification`` envelope, plus balance, settlement,
+    cancellation, wallet status, redeemable positions, and activity events.
 
 All use the ``websockets`` library (async) and run in a background thread
 so they can be used from synchronous code.
@@ -21,13 +22,13 @@ Usage::
     market_ws = BlinkMarketWs("wss://api.blink15.com")
     market_ws.on_snapshot = lambda data: print("Snapshot:", data)
     market_ws.on_trade = lambda data: print("Trade:", data)
-    market_ws.subscribe(["<token_id_hex_no_0x>"])
+    market_ws.subscribe(["0x<token_id_hex>"])
     market_ws.start()
 
     # Authenticated user events
     creds = ApiCreds(api_key="...", api_secret="...", api_passphrase="...")
     user_ws = BlinkUserWs("wss://api.blink15.com", creds)
-    user_ws.on_order_fill = lambda data: print("Fill:", data)
+    user_ws.on_order_fill = lambda fill: print("Fill:", fill)
     user_ws.start()
 """
 from __future__ import annotations
@@ -40,28 +41,26 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from .constants import WS_MARKET_PATH, WS_USER_PATH
+from .constants import WS_MARKET_PATH, WS_PRICE_PATH, WS_USER_PATH
 from .exceptions import BlinkWebSocketError
 from .types import ApiCreds
 
 logger = logging.getLogger(__name__)
 
-# Try to import the WS_PRICE_PATH constant; define fallback if not present.
-try:
-    from .constants import WS_PRICE_PATH
-except ImportError:
-    WS_PRICE_PATH = "/ws/price"
-
 # Callback type alias
 Callback = Callable[[Dict[str, Any]], None]
 
 
-def _strip_0x(hex_str: str) -> str:
-    """Return lowercase hex string with 0x prefix stripped."""
+def _ensure_0x(hex_str: str) -> str:
+    """Lowercase the string and add a `0x` prefix if it doesn't have one.
+
+    The backend emits and routes on `0x`-prefixed hex everywhere, so the
+    SDK stores subscriptions the same way -- otherwise the subscribe
+    echo ("0xabc...") won't match the locally-tracked set ("abc...") and
+    pending-subs never clear.
+    """
     s = hex_str.lower()
-    if s.startswith("0x"):
-        return s[2:]
-    return s
+    return s if s.startswith("0x") else f"0x{s}"
 
 
 # ---------------------------------------------------------------------------
@@ -349,21 +348,23 @@ class BlinkMarketWs(_BaseWs):
     """Public market data WebSocket.
 
     Connects to ``/ws/market`` and dispatches orderbook snapshots,
-    orderbook deltas, trades, and market-status events.
+    trades, and market-status events.
 
     Notes:
       - The server does NOT send a "connected" message on connect.
-      - asset_id values are lowercase hex WITHOUT 0x prefix.
-      - ``orderbook_delta`` and ``best_prices`` are defined in the protocol
-        but not currently emitted by the server.
+      - asset_id values are lowercase ``0x``-prefixed hex on the wire.
+        Callers can pass either form to ``subscribe()`` / ``resync()`` --
+        the SDK normalises before sending.
       - ``market_created`` and ``market_status`` are broadcast to ALL
         clients regardless of subscription.
 
     Callbacks (set as attributes):
         on_snapshot(data): Full orderbook snapshot.
-        on_delta(data): Incremental orderbook update (not currently emitted).
+        on_best_prices(data): Top-of-book update emitted alongside every
+            snapshot.  Data shape:
+            ``{type:"best_prices", market_id, asset_id, best_bid,
+            best_ask, timestamp}``.
         on_trade(data): Trade execution.
-        on_best_prices(data): Top-of-book update (not currently emitted).
         on_market_created(data): New market available (broadcast to all).
         on_market_status(data): Market status change (broadcast to all).
     """
@@ -371,17 +372,19 @@ class BlinkMarketWs(_BaseWs):
     def __init__(self, base_url: str) -> None:
         super().__init__(base_url, WS_MARKET_PATH)
 
-        # Event callbacks
+        # Backend never emits ``orderbook_delta`` (there is no delta
+        # channel -- only full snapshots), so ``on_delta`` stays removed.
+        # ``best_prices`` IS emitted by event_bridge.rs alongside every
+        # OrderbookSnapshot, so ``on_best_prices`` is exposed.
         self.on_snapshot: Optional[Callback] = None
-        self.on_delta: Optional[Callback] = None
-        self.on_trade: Optional[Callback] = None
         self.on_best_prices: Optional[Callback] = None
+        self.on_trade: Optional[Callback] = None
         self.on_market_created: Optional[Callback] = None
         self.on_market_status: Optional[Callback] = None
 
     def _normalise_asset_id(self, asset_id: str) -> str:
-        """Strip 0x prefix and lowercase for market channel."""
-        return _strip_0x(asset_id)
+        """Lowercase + 0x-prefix; matches the form the server echoes back."""
+        return _ensure_0x(asset_id)
 
     def subscribe_all(self) -> None:
         """Subscribe to all markets using the wildcard."""
@@ -419,17 +422,13 @@ class BlinkMarketWs(_BaseWs):
                 if self.on_snapshot:
                     self.on_snapshot(data)
 
-            elif event_type == "orderbook_delta":
-                if self.on_delta:
-                    self.on_delta(data)
+            elif event_type == "best_prices":
+                if self.on_best_prices:
+                    self.on_best_prices(data)
 
             elif event_type == "trade":
                 if self.on_trade:
                     self.on_trade(data)
-
-            elif event_type == "best_prices":
-                if self.on_best_prices:
-                    self.on_best_prices(data)
 
             elif event_type == "market_created":
                 if self.on_market_created:
@@ -534,24 +533,41 @@ class BlinkUserWs(_BaseWs):
       - On success: ``{"type": "authenticated", "address": "0x..."}``
       - On failure: ``{"type": "error", "code": "INVALID_CREDENTIALS", ...}``
       - Connection stays open on auth failure (client can retry).
-      - After auth, server sends: wallet_status, balance_update,
-        orders_snapshot, positions_snapshot.
 
-    Callbacks (set as attributes):
-        on_order_accepted(data)
-        on_order_rejected(data)
-        on_order_fill(data)
-        on_order_cancelled(data)
-        on_settlement(data)
-        on_position_update(data)
-        on_redeemable_position(data)
-        on_pnl_update(data)
-        on_wallet_status(data)
-        on_balance_update(data)
-        on_orders_snapshot(data)
-        on_positions_snapshot(data)
+    Callback API — one callback per SEMANTIC event.
+
+    Semantic events (fired from notification kinds, called with the inner payload dict):
+        on_order_accepted(data)    -- notification kind="order_accepted"
+        on_order_rejected(data)    -- notification kind="order_rejected"
+        on_order_fill(data)        -- notification kind="order_fill"
+        on_order_cancelled(data)   -- notification kind="order_cancelled"
+        on_redemption(data)        -- notification kind="redemption"
+
+    State events (one wire envelope each):
+        on_state_changed(data)         -- UserEvent::StateChanged
+        on_balance_update(data)        -- UserEvent::BalanceUpdate
+        on_settlement(data)            -- UserEvent::Settlement
+        on_wallet_status(data)         -- UserEvent::WalletStatus
+        on_redeemable_position(data)   -- UserEvent::RedeemablePosition
+        on_activity_created(data)      -- UserEvent::ActivityCreated
+
+    Control / fallback:
         on_authenticated()
-        on_auth_error(data)
+        on_auth_error(data)    -- credential issues only (INVALID_CREDENTIALS).
+                                  Named callbacks have priority; on_ws_error
+                                  is NOT fired for this code so existing
+                                  consumers don't double-fire.
+        on_ws_error(data)      -- generic fallback for every OTHER error code
+                                  from the server (UNAUTHORIZED_PROXY,
+                                  INTERNAL_ERROR, and any future codes).  If
+                                  unset, the error is logger.warning'd so it
+                                  is still surfaced.
+        on_error(exc)          -- transport-level Python exception (inherited
+                                  from ``_BaseWs``).
+        on_pong(data)
+        on_notification(full_envelope) -- STILL fires before kind-dispatch
+                                           so forward-compat consumers can
+                                           observe unknown ``kind`` values.
     """
 
     def __init__(self, base_url: str, creds: ApiCreds) -> None:
@@ -559,14 +575,37 @@ class BlinkUserWs(_BaseWs):
         self._creds = creds
         self._authenticated = False
 
-        # Event callbacks — unified event model
+        # Control / fallback callbacks
         self.on_authenticated: Optional[Callable[[], None]] = None
         self.on_auth_error: Optional[Callback] = None
+        # Generic error-code fallback: anything that is NOT
+        # INVALID_CREDENTIALS (UNAUTHORIZED_PROXY, INTERNAL_ERROR, ...)
+        # is dispatched here if set, so consumers can react rather than
+        # having errors vanish into logger.warning.
+        self.on_ws_error: Optional[Callback] = None
+        self.on_pong: Optional[Callback] = None
+        # on_error is already declared on _BaseWs (Exception handler);
+        # leave it alone here.
+
+        # State events — one wire envelope each.
         self.on_state_changed: Optional[Callback] = None
-        self.on_notification: Optional[Callback] = None
+        self.on_balance_update: Optional[Callback] = None
+        self.on_settlement: Optional[Callback] = None
         self.on_wallet_status: Optional[Callback] = None
         self.on_redeemable_position: Optional[Callback] = None
         self.on_activity_created: Optional[Callback] = None
+
+        # Generic notification hook — fires BEFORE kind-dispatch with the
+        # full envelope so forward-compat callers can log or react to
+        # `kind` values this client doesn't know about.
+        self.on_notification: Optional[Callback] = None
+
+        # Semantic events — one callback per notification kind.
+        self.on_order_accepted: Optional[Callback] = None
+        self.on_order_rejected: Optional[Callback] = None
+        self.on_order_fill: Optional[Callback] = None
+        self.on_order_cancelled: Optional[Callback] = None
+        self.on_redemption: Optional[Callback] = None
 
     @property
     def authenticated(self) -> bool:
@@ -603,6 +642,18 @@ class BlinkUserWs(_BaseWs):
         await ws.send(auth_msg)
         logger.debug("Sent auth message")
 
+    # Mapping from notification.kind -> SEMANTIC callback attribute name.
+    # Only the kinds the backend actually emits live here; adding a kind
+    # is one map entry, not a new branch.  Settlement and mint were
+    # removed: the backend never emits those kinds.
+    _NOTIFICATION_KIND_CALLBACK: Dict[str, str] = {
+        "order_accepted": "on_order_accepted",
+        "order_rejected": "on_order_rejected",
+        "order_fill": "on_order_fill",
+        "order_cancelled": "on_order_cancelled",
+        "redemption": "on_redemption",
+    }
+
     def _dispatch(self, data: Dict[str, Any]) -> None:
         event_type = data.get("type", "")
 
@@ -618,8 +669,26 @@ class BlinkUserWs(_BaseWs):
                     self.on_state_changed(data)
 
             elif event_type == "notification":
+                # Fire the generic forward-compat hook first so consumers
+                # can observe unknown kinds, then dispatch to the semantic
+                # callback for kinds we recognise.
                 if self.on_notification:
                     self.on_notification(data)
+                kind = data.get("kind", "")
+                inner = data.get("data", {}) or {}
+                cb_attr = self._NOTIFICATION_KIND_CALLBACK.get(kind)
+                if cb_attr is not None:
+                    cb = getattr(self, cb_attr, None)
+                    if cb is not None:
+                        cb(inner)
+
+            elif event_type == "balance_update":
+                if self.on_balance_update:
+                    self.on_balance_update(data)
+
+            elif event_type == "settlement":
+                if self.on_settlement:
+                    self.on_settlement(data)
 
             elif event_type == "wallet_status":
                 if self.on_wallet_status:
@@ -641,11 +710,17 @@ class BlinkUserWs(_BaseWs):
                     logger.error("Authentication failed: %s", msg)
                     if self.on_auth_error:
                         self.on_auth_error(data)
+                elif self.on_ws_error is not None:
+                    # Generic error-code dispatch.  UNAUTHORIZED_PROXY,
+                    # INTERNAL_ERROR, and any future server error codes
+                    # land here so consumers can react to them.
+                    self.on_ws_error(data)
                 else:
                     logger.warning("User WS error [%s]: %s", code, msg)
 
             elif event_type == "pong":
-                pass
+                if self.on_pong:
+                    self.on_pong(data)
 
             else:
                 logger.debug("Unhandled user event: %s", event_type)

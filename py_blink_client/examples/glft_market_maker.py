@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-GLFT market maker for Blink binary prediction markets.
+Production Market Maker -- Shaw & Dalen (2025) Framework
 
-Drives the full Guéant–Lehalle–Fernandez–Tapia finite-horizon solver off
-Blink's underlying price feed. Three business inputs drive everything
-else (fair value, belief vol, gamma, reservation price, inventory skew):
+Implements the Avellaneda-Stoikov market making model adapted for binary
+prediction markets using the logit-space framework from:
 
-  - CAPITAL: total USDC
-  - MAX_LOSS: max acceptable directional loss
-  - TICK_SIZE: exchange minimum tick
+  Shaw & Dalen, "Toward Black-Scholes for Prediction Markets:
+  A Unified Kernel and Market-Maker's Handbook", arXiv:2510.15205, 2025
+
+All pricing parameters derive from three business inputs:
+  - CAPITAL: total USDC available ($2,000)
+  - MAX_LOSS: maximum acceptable directional loss ($100)
+  - TICK_SIZE: exchange minimum price increment ($0.01)
+
+Everything else -- fair value, belief volatility, risk aversion, spread,
+reservation price, inventory skew -- is computed from the Pyth price feed
+and these three inputs using the exact formulas from the paper.
 
 Usage:
   cd py-blink-client
-  python3 examples/glft_market_maker.py
+  set -a && source ../backend/.env && set +a
+  python3 -m py_blink_client.examples.glft_market_maker
 """
 from __future__ import annotations
 
@@ -26,9 +34,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-# allow running as a script from the repo root
+# Ensure the package is importable when running as a script
 if __name__ == "__main__":
-    _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _pkg_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if _pkg_dir not in sys.path:
         sys.path.insert(0, _pkg_dir)
 
@@ -71,7 +79,7 @@ LEVELS = 5
 # Requote: event-driven, fires on every meaningful price change.
 REQUOTE_THRESHOLD_LOGIT = 0.03  # ~0.75c at p=0.50
 
-# feed staleness: cancel all orders if no tick for this long
+# Feed staleness: cancel all orders if no Pyth tick for this long
 STALE_FEED_MS = 10_000  # 10 seconds
 
 # Adverse selection: widen spread if fills are too one-sided
@@ -105,9 +113,11 @@ def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
-# pricing engine
+# ============================================================================
+# Shaw & Dalen (2025) -- Core Pricing Engine
+# ============================================================================
 
-# SPY annualized vol (~16%), converted to per-second.
+# SPY annualized volatility (~16%). Used to compute per-second vol.
 SIGMA_S_ANNUAL = float(os.environ.get("MM_SIGMA_ANNUAL", "0.16"))
 TRADING_SECONDS_PER_YEAR = 252 * 6.5 * 3600  # ~5.9M seconds
 SIGMA_S_PER_SEC = SIGMA_S_ANNUAL / math.sqrt(TRADING_SECONDS_PER_YEAR)
@@ -139,10 +149,10 @@ class QuoteResult:
 
 
 def compute_quotes(S: float, K: float, tau_secs: float, q: int) -> QuoteResult:
-    """Derive all quoting parameters from current market state.
+    """Compute all derived pricing parameters from market state.
 
-    Uses the finite-horizon GLFT ODE solution; sigma_b comes from Ito's
-    lemma applied to the binary option in logit space.
+    Uses the exact GLFT finite-horizon ODE solution (Theorem 1).
+    sigma_b derived from Ito's lemma on binary option pricing (Shaw & Dalen 2025).
     """
     global _active_solver, _solver_sigma_b, _solver_Q, _solver_gamma, _solver_k
 
@@ -415,7 +425,7 @@ class MarketMaker:
         self.current_price: float = 0.0
         self.last_reservation: float = -999.0
         self.requoting: bool = False
-        self.last_tick_ms: float = time.time() * 1000.0
+        self.last_pyth_tick_ms: float = time.time() * 1000.0
         self.orders_live: bool = False
         self.inventory = InventoryState()
         self.provisioned_markets: Set[str] = set()
@@ -687,7 +697,7 @@ class MarketMaker:
         self.provisioned_markets.add(market.id)
         self.active_market = market
         self.last_reservation = -999.0
-        self.last_tick_ms = time.time() * 1000.0
+        self.last_pyth_tick_ms = time.time() * 1000.0
         self.inventory.yes_tokens = 0.0
         self.inventory.no_tokens = 0.0
 
@@ -709,7 +719,7 @@ class MarketMaker:
             self.last_reservation = quotes.r_x
             self.orders_live = True
         else:
-            log("  Open price not yet available -- will place grid on first tick")
+            log("  Open price not yet available -- will place grid on first Pyth tick")
 
     # ------------------------------------------------------------------
     # WebSocket event handlers
@@ -735,12 +745,12 @@ class MarketMaker:
                 await self.provision_market(m)
 
     def _on_price_tick(self, event: Dict[str, Any]) -> None:
-        """Handle price ticks."""
+        """Handle Pyth price ticks."""
         if event.get("asset_id") != SYMBOL:
             return
-        prev_tick_ms = self.last_tick_ms
+        prev_tick_ms = self.last_pyth_tick_ms
         self.current_price = float(event.get("price", "0"))
-        self.last_tick_ms = time.time() * 1000.0
+        self.last_pyth_tick_ms = time.time() * 1000.0
 
         if self._loop:
             asyncio.run_coroutine_threadsafe(
@@ -748,7 +758,7 @@ class MarketMaker:
             )
 
     async def _handle_price_tick(self, prev_tick_ms: float) -> None:
-        now_ms = self.last_tick_ms
+        now_ms = self.last_pyth_tick_ms
         # Stale feed recovery
         if self.orders_live and prev_tick_ms > 0 and (now_ms - prev_tick_ms) > STALE_FEED_MS:
             gap = (now_ms - prev_tick_ms) / 1000.0
@@ -905,7 +915,7 @@ class MarketMaker:
                     import asyncio
                     await asyncio.sleep(13)  # 12s cooldown between claims
 
-        # CTF approval
+        # Get CTF approval (gasless, backend sponsors the ETH)
         if not ctf_ok:
             try:
                 resp = await self.client.prefund_ctf_approval(addr)
@@ -913,7 +923,7 @@ class MarketMaker:
             except Exception as e:
                 log(f"CTF approval failed: {e}")
 
-        # USDC approval via EIP-2612 permit
+        # Get USDC approval via EIP-2612 permit (gasless)
         if allowance < int(CAPITAL * 1e6):
             try:
                 # Sign a permit for max approval
@@ -921,10 +931,9 @@ class MarketMaker:
                 from eth_account.messages import encode_typed_data
                 import time as _time
 
-                from py_blink_client.constants import CONTRACTS
                 account = Account.from_key(self.client._private_key)
                 exchange = self.client.exchange_address
-                usdc_addr = CONTRACTS["usdc"]
+                usdc_addr = "0x9f702fa37809C1cb4e023f78F801f180a1DF5C8E"  # Circle USDC on Base Sepolia
                 deadline = str(2 ** 256 - 1)
                 value = str(2 ** 256 - 1)
 
@@ -991,7 +1000,7 @@ class MarketMaker:
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
 
-        log("=== GLFT Market Maker ===")
+        log("=== Production Market Maker (Shaw & Dalen 2025) ===")
         log(f"Capital: ${CAPITAL} | Max Loss: ${MAX_LOSS} | Tick: ${TICK_SIZE}")
         log(f"sigma_S(annual): {SIGMA_S_ANNUAL} | sigma_S(per sec): {SIGMA_S_PER_SEC:.4e}")
         log(f"Symbol: {SYMBOL} | Levels: {LEVELS}")
@@ -1039,7 +1048,7 @@ class MarketMaker:
         )
         self.market_ws.on_market_status = self._on_market_status
 
-        # price WS -- underlying price feed
+        # Price WS -- Pyth oracle price feeds
         self.price_ws = BlinkPriceWs(WS_URL)
         self.price_ws.on_price_tick = self._on_price_tick
         self.price_ws.on_connected = lambda: (
@@ -1047,12 +1056,16 @@ class MarketMaker:
             log(f"PriceWs subscribed: {SYMBOL}"),
         )
 
-        # User WS -- authenticated fills and order lifecycle
+        # User WS -- authenticated fills and order lifecycle.
+        # Accepts, fills, rejects, cancellations and redemptions all
+        # arrive as `notification` events demuxed by `kind`.  Position
+        # state is pushed as a single `state_changed` snapshot after
+        # every engine mutation.
         self.user_ws = BlinkUserWs(WS_URL, self.creds)
         self.user_ws.on_order_fill = self._on_order_fill
         self.user_ws.on_order_cancelled = self._on_order_cancelled
         self.user_ws.on_order_rejected = self._on_order_rejected
-        self.user_ws.on_position_update = self._on_position_update
+        self.user_ws.on_state_changed = self._on_position_update
         self.user_ws.on_authenticated = lambda: log("UserWs authenticated")
 
         # Start all WS connections

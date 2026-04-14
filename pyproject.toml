@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-blink-client"
-version = "0.4.0"
-description = "Python client for the Blink Markets CLOB API"
+version = "2.0.0"
+description = "Python client for the Blink Markets CLOB API — Polymarket drop-in compatible"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -15,6 +15,7 @@ dependencies = [
     "msgspec>=0.18,<1",
     "orjson>=3.9,<4",
     "eth-account>=0.13,<1",
+    "coincurve>=20,<21",
     "websockets>=13,<14",
 ]
 
@@ -23,6 +24,8 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3",
+    "aioresponses>=0.7",
+    "respx>=0.21",
 ]
 
 [tool.hatch.build.targets.wheel]

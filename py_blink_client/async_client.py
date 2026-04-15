@@ -1,4 +1,10 @@
-"""Async CLOB client, aiohttp-backed."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/async_client.py
+"""
+Async variant of ClobClient using aiohttp for true async concurrency.
+
+Shares all auth, signing, and order-building internals with the sync client.
+Uses separate trading + data connection pools via BlinkHttpClient.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,12 +28,13 @@ from ._order_builder import (
     build_market_order_amounts,
     calculate_market_price as _calculate_market_price,
 )
-from ._signing import BlinkSigner
+from ._signing import BlinkSigner, canonical_token_id
 from .constants import (
     BASE_SEPOLIA_CHAIN_ID,
     CONTRACTS,
     DEFAULT_API_URL,
     DEFAULT_TIMEOUT,
+    EP_ADMIN_HEALTH_DETAILED,
     EP_API_KEY,
     EP_API_KEYS,
     EP_BALANCE_ALLOWANCE,
@@ -62,6 +69,7 @@ from .constants import (
     EP_PRICE,
     EP_PRICE_HISTORY,
     EP_PRICES,
+    EP_PROFILE,
     EP_SPREAD,
     EP_TICK_SIZE,
     EP_TICKS,
@@ -88,6 +96,7 @@ from .types import (
     SignedOrderPayload,
     SideInt,
     SubmitOrderRequest,
+    SubmitOrderResponse,
     TradeParams,
 )
 
@@ -235,9 +244,10 @@ class AsyncClobClient:
         """Concurrently pre-fetch tick sizes, fee rates, neg risk."""
         tasks = []
         for tid in token_ids:
-            tasks.append(self.get_tick_size(tid))
-            tasks.append(self.get_fee_rate_bps(tid))
-            tasks.append(self.get_neg_risk(tid))
+            norm = canonical_token_id(tid)
+            tasks.append(self.get_tick_size(norm))
+            tasks.append(self.get_fee_rate_bps(norm))
+            tasks.append(self.get_neg_risk(norm))
         await asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------
@@ -351,6 +361,10 @@ class AsyncClobClient:
         """Check if the API is ready (GET /health/ready)."""
         return await self._http.get(EP_HEALTH_READY)
 
+    async def health_detailed(self, admin_key: str) -> Any:
+        """Get detailed health (GET /admin/health/detailed)."""
+        return await self._http.get(EP_ADMIN_HEALTH_DETAILED, headers={"X-Admin-Key": admin_key})
+
     async def get_server_time(self) -> Any:
         """Get server time (GET /time)."""
         return await self._http.get(EP_TIME)
@@ -389,6 +403,7 @@ class AsyncClobClient:
 
     async def get_order_book(self, token_id: str) -> OrderBookSummary:
         """Get the orderbook for a token."""
+        token_id = canonical_token_id(token_id)
         data = await self._http.get(EP_BOOK, params={"token_id": token_id})
         return OrderBookSummary.from_dict(data)
 
@@ -400,9 +415,9 @@ class AsyncClobClient:
     async def get_order_books(self, params: Union[List[BookParams], List[str]]) -> Any:
         """Get orderbooks for multiple tokens."""
         if params and isinstance(params[0], BookParams):
-            token_ids = [p.token_id for p in params]
+            token_ids = [canonical_token_id(p.token_id) for p in params]
         else:
-            token_ids = list(params)
+            token_ids = [canonical_token_id(t) for t in params]
         return await self._http.post(EP_BOOKS, body=json.dumps({"token_ids": token_ids}, separators=(",", ":")))
 
     async def get_order_book_hash(self, orderbook: OrderBookSummary) -> str:
@@ -426,38 +441,46 @@ class AsyncClobClient:
 
     async def get_midpoint(self, token_id: str) -> Any:
         """Get the midpoint price for a token."""
+        token_id = canonical_token_id(token_id)
         return await self._http.get(EP_MIDPOINT, params={"token_id": token_id})
 
     async def get_midpoints(self, params: Union[List[BookParams], List[str]]) -> Any:
         """Get midpoints for multiple tokens."""
         if params and isinstance(params[0], BookParams):
-            token_ids = [p.token_id for p in params]
+            token_ids = [canonical_token_id(p.token_id) for p in params]
         else:
-            token_ids = list(params)
+            token_ids = [canonical_token_id(t) for t in params]
         return await self._http.post(EP_MIDPOINTS, body=json.dumps({"token_ids": token_ids}, separators=(",", ":")))
 
     async def get_price(self, token_id: str, side: str = "BUY") -> Any:
         """Get the best price for a token on a given side."""
+        token_id = canonical_token_id(token_id)
         return await self._http.get(EP_PRICE, params={"token_id": token_id, "side": str(side)})
 
     async def get_prices(self, params: Union[List[BookParams], List[dict]]) -> Any:
         """Get prices for multiple token/side pairs."""
         if params and isinstance(params[0], BookParams):
-            requests = [{"token_id": p.token_id, "side": p.side} for p in params]
+            requests = [{"token_id": canonical_token_id(p.token_id), "side": p.side} for p in params]
         else:
-            requests = list(params)
+            requests = [
+                {**r, "token_id": canonical_token_id(r["token_id"])} if isinstance(r, dict) and "token_id" in r else r
+                for r in params
+            ]
         return await self._http.post(EP_PRICES, body=json.dumps({"requests": requests}, separators=(",", ":")))
 
     async def get_spread(self, token_id: str) -> Any:
         """Get the bid-ask spread for a token."""
+        token_id = canonical_token_id(token_id)
         return await self._http.get(EP_SPREAD, params={"token_id": token_id})
 
     async def get_last_trade_price(self, token_id: str) -> Any:
         """Get the last trade price for a token."""
+        token_id = canonical_token_id(token_id)
         return await self._http.get(EP_LAST_TRADE_PRICE, params={"token_id": token_id})
 
     async def get_tick_size(self, token_id: str) -> Any:
         """Get the tick size for a token (cached)."""
+        token_id = canonical_token_id(token_id)
         if token_id in self._tick_size_cache:
             return {"minimum_tick_size": self._tick_size_cache[token_id]}
         resp = await self._http.get(EP_TICK_SIZE, params={"token_id": token_id})
@@ -467,6 +490,7 @@ class AsyncClobClient:
 
     async def get_neg_risk(self, token_id: str) -> Any:
         """Get the neg-risk status for a token (cached)."""
+        token_id = canonical_token_id(token_id)
         if token_id in self._neg_risk_cache:
             return {"neg_risk": self._neg_risk_cache[token_id]}
         resp = await self._http.get(EP_NEG_RISK, params={"token_id": token_id})
@@ -476,6 +500,7 @@ class AsyncClobClient:
 
     async def get_fee_rate_bps(self, token_id: str) -> Any:
         """Get the fee rate for a token (cached)."""
+        token_id = canonical_token_id(token_id)
         if token_id in self._fee_rate_cache:
             return {"base_fee": self._fee_rate_cache[token_id]}
         resp = await self._http.get(EP_FEE_RATE, params={"token_id": token_id})
@@ -497,6 +522,7 @@ class AsyncClobClient:
 
     async def get_price_history(self, token_id: str) -> Any:
         """Get price history for a token (GET /prices/{token_id}/history)."""
+        token_id = canonical_token_id(token_id)
         return await self._http.get(f"{EP_PRICE_HISTORY}{token_id}/history")
 
     async def get_upcoming_markets(self, limit: int = 10) -> Any:
@@ -511,15 +537,16 @@ class AsyncClobClient:
         """Get orderbook for a specific market."""
         params: Optional[Dict[str, str]] = None
         if token_id:
-            params = {"token_id": token_id}
+            params = {"token_id": canonical_token_id(token_id)}
         return await self._http.get(f"{EP_MARKET}{market_id}/orderbook", params=params)
 
     async def get_unified_order_book(self, token_id: str) -> Any:
         """Get unified orderbook (GET /book/unified?token_id=)."""
+        token_id = canonical_token_id(token_id)
         return await self._http.get(EP_BOOK_UNIFIED, params={"token_id": token_id})
 
     # ==================================================================
-    # FAUCET (public, no auth)
+    # FAUCET / GAS SPONSORSHIP (public, no auth)
     # ==================================================================
 
     async def claim_faucet(self, address: Optional[str] = None) -> Any:
@@ -531,13 +558,13 @@ class AsyncClobClient:
 
     async def relay_permit(self, owner: str, spender: str, value: str,
                            deadline: str, v: int, r: str, s: str) -> Any:
-        """Relay a USDC EIP-2612 permit."""
+        """Relay a gas-free USDC EIP-2612 permit."""
         body = {"owner": owner, "spender": spender, "value": value,
                 "deadline": deadline, "v": v, "r": r, "s": s}
         return await self._http.post(EP_PERMIT, body=json.dumps(body, separators=(",", ":")))
 
     async def prefund_ctf_approval(self, address: Optional[str] = None) -> Any:
-        """Request a CTF approval for the given address."""
+        """Sponsor ETH for a CTF approval transaction."""
         addr = address or self._address
         if not addr:
             raise BlinkAuthError("Address required")
@@ -552,7 +579,7 @@ class AsyncClobClient:
         """Get balance and allowance (L2 auth)."""
         params: Dict[str, str] = {"asset_type": asset_type}
         if token_id:
-            params["token_id"] = token_id
+            params["token_id"] = canonical_token_id(token_id)
         headers = self._l2_headers("GET", EP_BALANCE_ALLOWANCE)
         data = await self._http.get(EP_BALANCE_ALLOWANCE, params=params, headers=headers)
         return BalanceAllowance.from_dict(data)
@@ -562,7 +589,7 @@ class AsyncClobClient:
         """Force-refresh cached balance/allowance (L2 auth)."""
         params: Dict[str, str] = {"asset_type": asset_type}
         if token_id:
-            params["token_id"] = token_id
+            params["token_id"] = canonical_token_id(token_id)
         headers = self._l2_headers("GET", EP_BALANCE_ALLOWANCE_UPDATE)
         return await self._http.get(EP_BALANCE_ALLOWANCE_UPDATE, params=params, headers=headers)
 
@@ -572,7 +599,7 @@ class AsyncClobClient:
         """Get balance/allowance without auth (public)."""
         params: Dict[str, str] = {"address": address, "asset_type": asset_type}
         if token_id:
-            params["token_id"] = token_id
+            params["token_id"] = canonical_token_id(token_id)
         return await self._http.get(EP_BALANCE_PUBLIC, params=params)
 
     async def get_wallet_status(self, address: Optional[str] = None) -> Any:
@@ -632,6 +659,16 @@ class AsyncClobClient:
         return await self._http.get("/users/search", params=params or None)
 
     # ==================================================================
+    # PROFILE (Privy JWT auth)
+    # ==================================================================
+
+    async def update_profile(self, token: str, data: Dict[str, str]) -> Any:
+        """Update user profile (Privy JWT auth)."""
+        body_str = json.dumps(data, separators=(",", ":"))
+        return await self._http.post(EP_PROFILE, body=body_str,
+                                     headers={"Authorization": f"Bearer {token}"})
+
+    # ==================================================================
     # API KEY MANAGEMENT (L1 auth)
     # ==================================================================
 
@@ -688,7 +725,11 @@ class AsyncClobClient:
     # ==================================================================
 
     async def _build_signed_order(self, args: OrderArgs) -> SignedOrder:
-        """Build and EIP-712 sign an order from user-friendly args."""
+        """Build and EIP-712 sign an order from user-friendly args.
+
+        Unlike the sync client, this fetches tick size and fee rate
+        via async I/O on cache miss (never silently defaults to "0.01").
+        """
         if not self._signer:
             raise BlinkAuthError("Private key required for order signing")
 
@@ -735,7 +776,7 @@ class AsyncClobClient:
             token_id=args.token_id, maker_amount=str(maker_amount),
             taker_amount=str(taker_amount), expiration=str(args.expiration),
             nonce=str(args.nonce), fee_rate_bps=str(args.fee_rate_bps),
-            side=side_int, signature_type=self.signature_type,
+            side=side_int, signature_type=SignatureType(self.signature_type),
             signature=signature,
         )
 
@@ -743,6 +784,8 @@ class AsyncClobClient:
         """Build and sign an order locally (does NOT submit).
 
         Returns a plain dict with camelCase keys (Polymarket wire format).
+        Calls ``await self.get_tick_size()`` on cache miss instead of
+        silently defaulting to ``"0.01"``.
         """
         signed = await self._build_signed_order(args)
         return signed.to_dict()
@@ -754,12 +797,30 @@ class AsyncClobClient:
         post_only: bool = False,
         deferExec: bool = False,
         order_type: Optional[str] = None,
-    ) -> Any:
-        """Submit a pre-signed order to the exchange (L2 HMAC auth)."""
+    ) -> SubmitOrderResponse:
+        """Submit a pre-signed order to the exchange (L2 HMAC auth).
+
+        Returns a :class:`~py_blink_client.types.SubmitOrderResponse`
+        (forward-compat ``raw`` field preserves the full server payload).
+
+        ``post_only`` is honoured only for resting order types
+        (``GTC`` / ``GTD``).  For ``FOK`` / ``IOC`` the flag is downgraded
+        to ``False`` and a warning is logged — combining ``post_only``
+        with an immediate order is a caller bug, but silently flipping
+        the flag would hide intent.
+        """
         if not self.creds:
             raise BlinkAuthError("API credentials required")
 
         ot = order_type or orderType
+
+        # Fix 7: Silent flag downgrades hide intent — warn, don't fail.
+        effective_post_only = post_only and ot in (OrderType.GTC, OrderType.GTD)
+        if post_only and not effective_post_only:
+            logger.warning(
+                "post_only=True ignored for order_type=%s "
+                "(post_only only applies to GTC/GTD).", ot,
+            )
 
         if isinstance(order, SignedOrder):
             order_dict = order.to_dict()
@@ -786,13 +847,15 @@ class AsyncClobClient:
             ),
             owner=self.creds.api_key,
             order_type=ot,
-            post_only=post_only and ot in (OrderType.GTC, OrderType.GTD),
+            post_only=effective_post_only,
         )
 
         body_bytes = _msgspec_encoder.encode(payload_struct)
         body_str = body_bytes.decode()
         headers = self._l2_headers("POST", EP_ORDER, body_str)
-        return await self._http.post(EP_ORDER, body=body_bytes, headers=headers)
+        raw = await self._http.post(EP_ORDER, body=body_bytes, headers=headers)
+        # Fix 5: Typed response — forward-compatible via `raw` escape hatch.
+        return SubmitOrderResponse.from_dict(raw if isinstance(raw, dict) else {})
 
     async def create_and_post_order(
         self,
@@ -819,8 +882,13 @@ class AsyncClobClient:
         signed = await self.create_market_order(args, options=options)
         return await self.post_order(signed, orderType=ot)
 
-    async def post_orders(self, orders: List[Union[Dict[str, Any], PostOrdersArgs]]) -> Any:
-        """Submit multiple pre-signed orders (max 10, L2 auth)."""
+    async def post_orders(self, orders: List[Union[Dict[str, Any], PostOrdersArgs]]) -> List[SubmitOrderResponse]:
+        """Submit multiple pre-signed orders (max 10, L2 auth).
+
+        Returns a parallel list of :class:`SubmitOrderResponse`.  If the
+        server returns a non-list payload (error shape) the result is a
+        single-element list whose ``.raw`` carries the full body.
+        """
         if not self.creds:
             raise BlinkAuthError("API credentials required")
         if len(orders) > 10:
@@ -840,7 +908,11 @@ class AsyncClobClient:
 
         body_str = json.dumps(payloads, separators=(",", ":"), sort_keys=False)
         headers = self._l2_headers("POST", EP_ORDERS, body_str)
-        return await self._http.post(EP_ORDERS, body=body_str, headers=headers)
+        raw = await self._http.post(EP_ORDERS, body=body_str, headers=headers)
+        # Fix 5: Typed response — forward-compatible via `raw` escape hatch.
+        if isinstance(raw, list):
+            return [SubmitOrderResponse.from_dict(r if isinstance(r, dict) else {}) for r in raw]
+        return [SubmitOrderResponse.from_dict(raw if isinstance(raw, dict) else {})]
 
     async def cancel(self, order_id: str) -> Any:
         """Cancel a single order (L2 auth)."""
@@ -867,7 +939,8 @@ class AsyncClobClient:
 
     async def cancel_market_orders(self, market: Optional[str] = None,
                                    asset_id: Optional[str] = None) -> Any:
-        """Cancel orders for a specific market/asset."""
+        """Cancel orders for a specific market/asset (client-side filter)."""
+        asset_id_norm = canonical_token_id(asset_id) if asset_id else None
         all_orders = await self.get_orders()
         to_cancel: List[str] = []
         for o in all_orders:
@@ -876,7 +949,7 @@ class AsyncClobClient:
                 continue
             if market and o.get("market_id", o.get("market", "")) != market:
                 continue
-            if asset_id and o.get("asset_id", o.get("token_id", "")) != asset_id:
+            if asset_id_norm and o.get("asset_id", o.get("token_id", "")) != asset_id_norm:
                 continue
             to_cancel.append(oid)
 
@@ -889,7 +962,10 @@ class AsyncClobClient:
     # ==================================================================
 
     async def get_orders(self, params: Union[None, Dict[str, str], OpenOrderParams] = None) -> List[Dict[str, Any]]:
-        """Get open orders. ``params`` filters client-side."""
+        """Get all open orders (single fetch, client-side filter).
+
+        Applies client-side filtering from OpenOrderParams after fetch.
+        """
         query: Optional[Dict[str, str]] = None
         if params is not None:
             if hasattr(params, "to_dict"):
@@ -924,7 +1000,7 @@ class AsyncClobClient:
         return OpenOrder.from_dict(data)
 
     async def get_trades(self, params: Union[None, str, Dict[str, str], TradeParams] = None) -> List[Dict[str, Any]]:
-        """Get trades. ``params`` filters client-side."""
+        """Get all trades (single fetch, client-side filter)."""
         query: Dict[str, str] = {}
         if params is not None:
             if hasattr(params, "to_dict"):
@@ -1000,11 +1076,22 @@ class AsyncClobClient:
 
     async def list_orders(self, market_id: Optional[str] = None, maker: Optional[str] = None,
                           status: Optional[str] = None, limit: Optional[int] = None) -> Any:
-        """List orders via /orders endpoint (richer filtering)."""
+        """List orders via /orders endpoint (richer filtering).
+
+        The server honours the ``maker`` filter; when no maker is
+        supplied the backend returns ``[]`` rather than treating the
+        caller as the maker.  To avoid a silently-empty result we
+        default ``maker`` to the signer's address when the client has
+        one.  Pass ``maker=""`` explicitly to opt out of this default.
+        """
+        # Fix 4: Default `maker` so callers aren't surprised by an empty list.
+        if maker is None and self._address:
+            maker = self._address
+
         params: Dict[str, str] = {}
         if market_id is not None:
             params["market_id"] = market_id
-        if maker is not None:
+        if maker:
             params["maker"] = maker
         if status is not None:
             params["status"] = status

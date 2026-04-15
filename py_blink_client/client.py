@@ -1,4 +1,24 @@
-"""Sync CLOB client for the Blink prediction-market order book."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/client.py
+"""
+Blink Markets CLOB client.
+
+Provides ``ClobClient`` -- the main entry point for interacting with the
+Blink prediction-market order book. Drop-in compatible with Polymarket's
+``py-clob-client``.
+
+Usage::
+
+    from py_blink_client import ClobClient, OrderArgs, OrderType
+
+    client = ClobClient("https://api.blink15.com", key="0x...")
+    creds = client.create_or_derive_api_creds()
+    client.set_api_creds(creds)
+
+    markets = client.get_markets()
+    token_id = markets["data"][0]["yes_token_id"]
+    signed = client.create_order(OrderArgs(token_id=token_id, price=0.55, size=10, side="BUY"))
+    resp = client.post_order(signed, orderType=OrderType.GTC)
+"""
 from __future__ import annotations
 
 import hashlib
@@ -26,7 +46,7 @@ from ._order_builder import (
     round_normal,
     to_token_decimals,
 )
-from ._signing import BlinkSigner, _parse_token_id
+from ._signing import BlinkSigner, _parse_token_id, canonical_token_id
 from .constants import (
     BASE_SEPOLIA_CHAIN_ID,
     COLLATERAL_SCALE,
@@ -34,6 +54,7 @@ from .constants import (
     DEFAULT_API_URL,
     DEFAULT_TIMEOUT,
     END_CURSOR,
+    EP_ADMIN_HEALTH_DETAILED,
     EP_API_KEY,
     EP_API_KEYS,
     EP_BALANCE_ALLOWANCE,
@@ -68,6 +89,7 @@ from .constants import (
     EP_PRICE,
     EP_PRICE_HISTORY,
     EP_PRICES,
+    EP_PROFILE,
     EP_SPREAD,
     EP_TICK_SIZE,
     EP_TICKS,
@@ -98,6 +120,7 @@ from .types import (
     SignedOrderPayload,
     SideInt,
     SubmitOrderRequest,
+    SubmitOrderResponse,
     Trade,
     TradeParams,
 )
@@ -265,13 +288,15 @@ class ClobClient:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        tids = [canonical_token_id(t) for t in token_ids]
+
         def _fetch_one(tid: str) -> None:
             self.get_tick_size(tid)
             self.get_fee_rate_bps(tid)
             self.get_neg_risk(tid)
 
-        with ThreadPoolExecutor(max_workers=min(len(token_ids) * 3, 20)) as pool:
-            futures = [pool.submit(_fetch_one, tid) for tid in token_ids]
+        with ThreadPoolExecutor(max_workers=min(len(tids) * 3, 20)) as pool:
+            futures = [pool.submit(_fetch_one, tid) for tid in tids]
             for f in as_completed(futures):
                 f.result()  # Raise any exceptions
 
@@ -387,9 +412,9 @@ class ClobClient:
                 self._neg_risk_cache[token_id] = False
         return self._neg_risk_cache[token_id]
 
-    # ------------------------------------------------------------------
-    # public endpoints (no auth)
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # PUBLIC ENDPOINTS (no auth) -- see Task 10
+    # ==================================================================
 
     def get_ok(self) -> Any:
         """Root health check (GET /)."""
@@ -402,6 +427,10 @@ class ClobClient:
     def health_ready(self) -> Any:
         """Check if the API is ready (GET /health/ready)."""
         return self._get(EP_HEALTH_READY)
+
+    def health_detailed(self, admin_key: str) -> Any:
+        """Get detailed health (GET /admin/health/detailed)."""
+        return self._get(EP_ADMIN_HEALTH_DETAILED, headers={"X-Admin-Key": admin_key})
 
     def get_server_time(self) -> Any:
         """Get server time (GET /time)."""
@@ -441,6 +470,7 @@ class ClobClient:
 
     def get_order_book(self, token_id: str) -> OrderBookSummary:
         """Get the orderbook for a token."""
+        token_id = canonical_token_id(token_id)
         data = self._get(EP_BOOK, params={"token_id": token_id})
         return OrderBookSummary.from_dict(data)
 
@@ -454,9 +484,9 @@ class ClobClient:
         token_id strings. Translates to Blink's ``POST /books`` body format.
         """
         if params and isinstance(params[0], BookParams):
-            token_ids = [p.token_id for p in params]
+            token_ids = [canonical_token_id(p.token_id) for p in params]
         else:
-            token_ids = list(params)
+            token_ids = [canonical_token_id(t) for t in params]
         return self._post(EP_BOOKS, body=json.dumps({"token_ids": token_ids}, separators=(",", ":")))
 
     def get_order_book_hash(self, orderbook: OrderBookSummary) -> str:
@@ -480,38 +510,46 @@ class ClobClient:
 
     def get_midpoint(self, token_id: str) -> Any:
         """Get the midpoint price for a token."""
+        token_id = canonical_token_id(token_id)
         return self._get(EP_MIDPOINT, params={"token_id": token_id})
 
     def get_midpoints(self, params: Union[List[BookParams], List[str]]) -> Any:
         """Get midpoints for multiple tokens."""
         if params and isinstance(params[0], BookParams):
-            token_ids = [p.token_id for p in params]
+            token_ids = [canonical_token_id(p.token_id) for p in params]
         else:
-            token_ids = list(params)
+            token_ids = [canonical_token_id(t) for t in params]
         return self._post(EP_MIDPOINTS, body=json.dumps({"token_ids": token_ids}, separators=(",", ":")))
 
     def get_price(self, token_id: str, side: str = "BUY") -> Any:
         """Get the best price for a token on a given side."""
+        token_id = canonical_token_id(token_id)
         return self._get(EP_PRICE, params={"token_id": token_id, "side": str(side)})
 
     def get_prices(self, params: Union[List[BookParams], List[dict]]) -> Any:
         """Get prices for multiple token/side pairs."""
         if params and isinstance(params[0], BookParams):
-            requests = [{"token_id": p.token_id, "side": p.side} for p in params]
+            requests = [{"token_id": canonical_token_id(p.token_id), "side": p.side} for p in params]
         else:
-            requests = list(params)
+            requests = [
+                {**r, "token_id": canonical_token_id(r["token_id"])} if isinstance(r, dict) and "token_id" in r else r
+                for r in params
+            ]
         return self._post(EP_PRICES, body=json.dumps({"requests": requests}, separators=(",", ":")))
 
     def get_spread(self, token_id: str) -> Any:
         """Get the bid-ask spread for a token."""
+        token_id = canonical_token_id(token_id)
         return self._get(EP_SPREAD, params={"token_id": token_id})
 
     def get_last_trade_price(self, token_id: str) -> Any:
         """Get the last trade price for a token."""
+        token_id = canonical_token_id(token_id)
         return self._get(EP_LAST_TRADE_PRICE, params={"token_id": token_id})
 
     def get_tick_size(self, token_id: str) -> Any:
         """Get the tick size for a token (cached)."""
+        token_id = canonical_token_id(token_id)
         if token_id in self._tick_size_cache:
             return {"minimum_tick_size": self._tick_size_cache[token_id]}
         resp = self._get(EP_TICK_SIZE, params={"token_id": token_id})
@@ -521,6 +559,7 @@ class ClobClient:
 
     def get_neg_risk(self, token_id: str) -> Any:
         """Get the neg-risk status for a token (cached)."""
+        token_id = canonical_token_id(token_id)
         if token_id in self._neg_risk_cache:
             return {"neg_risk": self._neg_risk_cache[token_id]}
         resp = self._get(EP_NEG_RISK, params={"token_id": token_id})
@@ -530,6 +569,7 @@ class ClobClient:
 
     def get_fee_rate_bps(self, token_id: str) -> Any:
         """Get the fee rate for a token (cached)."""
+        token_id = canonical_token_id(token_id)
         if token_id in self._fee_rate_cache:
             return {"base_fee": self._fee_rate_cache[token_id]}
         resp = self._get(EP_FEE_RATE, params={"token_id": token_id})
@@ -551,6 +591,7 @@ class ClobClient:
 
     def get_price_history(self, token_id: str) -> Any:
         """Get price history for a token (GET /prices/{token_id}/history)."""
+        token_id = canonical_token_id(token_id)
         return self._get(f"{EP_PRICE_HISTORY}{token_id}/history")
 
     def get_upcoming_markets(self, limit: int = 10) -> Any:
@@ -565,15 +606,16 @@ class ClobClient:
         """Get orderbook for a specific market."""
         params: Optional[Dict[str, str]] = None
         if token_id:
-            params = {"token_id": token_id}
+            params = {"token_id": canonical_token_id(token_id)}
         return self._get(f"{EP_MARKET}{market_id}/orderbook", params=params)
 
     def get_unified_order_book(self, token_id: str) -> Any:
         """Get unified orderbook (GET /book/unified?token_id=)."""
+        token_id = canonical_token_id(token_id)
         return self._get(EP_BOOK_UNIFIED, params={"token_id": token_id})
 
     # ==================================================================
-    # FAUCET (public, no auth)
+    # FAUCET / GAS SPONSORSHIP (public, no auth)
     # ==================================================================
 
     def claim_faucet(self, address: Optional[str] = None) -> Any:
@@ -585,13 +627,13 @@ class ClobClient:
 
     def relay_permit(self, owner: str, spender: str, value: str,
                      deadline: str, v: int, r: str, s: str) -> Any:
-        """Relay a USDC EIP-2612 permit."""
+        """Relay a gas-free USDC EIP-2612 permit."""
         body = {"owner": owner, "spender": spender, "value": value,
                 "deadline": deadline, "v": v, "r": r, "s": s}
         return self._post(EP_PERMIT, body=json.dumps(body, separators=(",", ":")))
 
     def prefund_ctf_approval(self, address: Optional[str] = None) -> Any:
-        """Request a CTF approval for the given address."""
+        """Sponsor ETH for a CTF approval transaction."""
         addr = address or self._address
         if not addr:
             raise BlinkAuthError("Address required")
@@ -606,7 +648,7 @@ class ClobClient:
         """Get balance and allowance (L2 auth)."""
         params: Dict[str, str] = {"asset_type": asset_type}
         if token_id:
-            params["token_id"] = token_id
+            params["token_id"] = canonical_token_id(token_id)
         headers = self._l2_headers("GET", EP_BALANCE_ALLOWANCE)
         data = self._get(EP_BALANCE_ALLOWANCE, params=params, headers=headers)
         return BalanceAllowance.from_dict(data)
@@ -616,7 +658,7 @@ class ClobClient:
         """Force-refresh cached balance/allowance (L2 auth)."""
         params: Dict[str, str] = {"asset_type": asset_type}
         if token_id:
-            params["token_id"] = token_id
+            params["token_id"] = canonical_token_id(token_id)
         headers = self._l2_headers("GET", EP_BALANCE_ALLOWANCE_UPDATE)
         return self._get(EP_BALANCE_ALLOWANCE_UPDATE, params=params, headers=headers)
 
@@ -626,7 +668,7 @@ class ClobClient:
         """Get balance/allowance without auth (public)."""
         params: Dict[str, str] = {"address": address, "asset_type": asset_type}
         if token_id:
-            params["token_id"] = token_id
+            params["token_id"] = canonical_token_id(token_id)
         return self._get(EP_BALANCE_PUBLIC, params=params)
 
     def get_wallet_status(self, address: Optional[str] = None) -> Any:
@@ -684,6 +726,16 @@ class ClobClient:
         if query is not None:
             params["q"] = query
         return self._get("/users/search", params=params or None)
+
+    # ==================================================================
+    # PROFILE (Privy JWT auth)
+    # ==================================================================
+
+    def update_profile(self, token: str, data: Dict[str, str]) -> Any:
+        """Update user profile (Privy JWT auth)."""
+        body_str = json.dumps(data, separators=(",", ":"))
+        return self._post(EP_PROFILE, body=body_str,
+                         headers={"Authorization": f"Bearer {token}"})
 
     # ==================================================================
     # API KEY MANAGEMENT (L1 auth)
@@ -785,7 +837,7 @@ class ClobClient:
             token_id=args.token_id, maker_amount=str(maker_amount),
             taker_amount=str(taker_amount), expiration=str(args.expiration),
             nonce=str(args.nonce), fee_rate_bps=str(args.fee_rate_bps),
-            side=side_int, signature_type=self.signature_type,
+            side=side_int, signature_type=SignatureType(self.signature_type),
             signature=signature,
         )
 
@@ -804,15 +856,35 @@ class ClobClient:
         post_only: bool = False,
         deferExec: bool = False,
         order_type: Optional[str] = None,
-    ) -> Any:
+    ) -> SubmitOrderResponse:
         """Submit a pre-signed order to the exchange (L2 HMAC auth).
 
         Uses msgspec for fast payload serialization on the hot path.
+
+        Returns a :class:`~py_blink_client.types.SubmitOrderResponse`
+        with ``order_id``, ``order_hash``, ``status``, and ``matches``.
+        The full server payload is preserved on ``.raw`` for
+        forward-compat.
+
+        ``post_only=True`` only applies to resting order types (``GTC``
+        and ``GTD``).  If a non-resting type (``FOK``/``IOC``) is used
+        with ``post_only=True`` the flag is downgraded to ``False`` and
+        a warning is logged — passing ``post_only`` with an immediate
+        order is almost certainly a caller bug, but raising would break
+        existing callers.
         """
         if not self.creds:
             raise BlinkAuthError("API credentials required")
 
         ot = order_type or orderType
+
+        # Fix 7: Silent flag downgrades hide intent — warn, don't fail.
+        effective_post_only = post_only and ot in (OrderType.GTC, OrderType.GTD)
+        if post_only and not effective_post_only:
+            logger.warning(
+                "post_only=True ignored for order_type=%s "
+                "(post_only only applies to GTC/GTD).", ot,
+            )
 
         # Build the order dict
         if isinstance(order, SignedOrder):
@@ -841,13 +913,15 @@ class ClobClient:
             ),
             owner=self.creds.api_key,
             order_type=ot,
-            post_only=post_only and ot in (OrderType.GTC, OrderType.GTD),
+            post_only=effective_post_only,
         )
 
         body_bytes = _msgspec_encoder.encode(payload_struct)
         body_str = body_bytes.decode()
         headers = self._l2_headers("POST", EP_ORDER, body_str)
-        return self._post(EP_ORDER, body=body_bytes, headers=headers)
+        raw = self._post(EP_ORDER, body=body_bytes, headers=headers)
+        # Fix 5: Typed response — forward-compatible via `raw` escape hatch.
+        return SubmitOrderResponse.from_dict(raw if isinstance(raw, dict) else {})
 
     def create_and_post_order(
         self,
@@ -874,8 +948,15 @@ class ClobClient:
         signed = self.create_market_order(args, options=options)
         return self.post_order(signed, orderType=ot)
 
-    def post_orders(self, orders: List[Union[Dict[str, Any], PostOrdersArgs]]) -> Any:
-        """Submit multiple pre-signed orders (max 10, L2 auth)."""
+    def post_orders(self, orders: List[Union[Dict[str, Any], PostOrdersArgs]]) -> List[SubmitOrderResponse]:
+        """Submit multiple pre-signed orders (max 10, L2 auth).
+
+        Returns a parallel list of
+        :class:`~py_blink_client.types.SubmitOrderResponse`, one per
+        submitted order.  If the backend returns anything other than a
+        list (e.g. an error envelope) the result is a single-element
+        list whose ``.raw`` contains the full payload.
+        """
         if not self.creds:
             raise BlinkAuthError("API credentials required")
         if len(orders) > 10:
@@ -895,7 +976,11 @@ class ClobClient:
 
         body_str = json.dumps(payloads, separators=(",", ":"), sort_keys=False)
         headers = self._l2_headers("POST", EP_ORDERS, body_str)
-        return self._post(EP_ORDERS, body=body_str, headers=headers)
+        raw = self._post(EP_ORDERS, body=body_str, headers=headers)
+        # Fix 5: Typed response — forward-compatible via `raw` escape hatch.
+        if isinstance(raw, list):
+            return [SubmitOrderResponse.from_dict(r if isinstance(r, dict) else {}) for r in raw]
+        return [SubmitOrderResponse.from_dict(raw if isinstance(raw, dict) else {})]
 
     def cancel(self, order_id: str) -> Any:
         """Cancel a single order (L2 auth)."""
@@ -920,7 +1005,8 @@ class ClobClient:
 
     def cancel_market_orders(self, market: Optional[str] = None,
                              asset_id: Optional[str] = None) -> Any:
-        """Cancel orders for a specific market/asset."""
+        """Cancel orders for a specific market/asset (client-side filter)."""
+        asset_id_norm = canonical_token_id(asset_id) if asset_id else None
         all_orders = self.get_orders()
         to_cancel: List[str] = []
         for o in all_orders:
@@ -929,7 +1015,7 @@ class ClobClient:
                 continue
             if market and o.get("market_id", o.get("market", "")) != market:
                 continue
-            if asset_id and o.get("asset_id", o.get("token_id", "")) != asset_id:
+            if asset_id_norm and o.get("asset_id", o.get("token_id", "")) != asset_id_norm:
                 continue
             to_cancel.append(oid)
 
@@ -942,9 +1028,23 @@ class ClobClient:
     # ==================================================================
 
     def get_orders(self, params: Union[None, Dict[str, str], OpenOrderParams] = None) -> List[Dict[str, Any]]:
-        """Get all open orders. ``params`` filters client-side."""
+        """Get open orders, forwarding filter params to the server.
+
+        Mirrors the async client: the server accepts ``market_id`` /
+        ``asset_id`` / ``id`` via L2 HMAC auth, so we forward
+        ``OpenOrderParams.to_dict()`` as the query string instead of
+        fetching everything and filtering locally.  A post-fetch refine
+        stays so any field the server doesn't filter on still narrows.
+        """
+        query: Optional[Dict[str, str]] = None
+        if params is not None:
+            if hasattr(params, "to_dict"):
+                query = params.to_dict()
+            elif isinstance(params, dict):
+                query = dict(params)
+
         headers = self._l2_headers("GET", EP_DATA_ORDERS)
-        data = self._get(EP_DATA_ORDERS, headers=headers)
+        data = self._get(EP_DATA_ORDERS, params=query or None, headers=headers)
 
         results: List[Dict[str, Any]] = []
         if isinstance(data, list):
@@ -952,6 +1052,9 @@ class ClobClient:
         elif isinstance(data, dict):
             results = data.get("data", data.get("orders", []))
 
+        # Client-side refinement -- server has already filtered on the
+        # fields it knows about; this catches any remaining mismatches
+        # (alternate field names in legacy responses).
         if isinstance(params, OpenOrderParams):
             if params.market:
                 results = [o for o in results if o.get("market", o.get("market_id", "")) == params.market]
@@ -969,7 +1072,7 @@ class ClobClient:
         return OpenOrder.from_dict(data)
 
     def get_trades(self, params: Union[None, str, Dict[str, str], TradeParams] = None) -> List[Dict[str, Any]]:
-        """Get trades. ``params`` filters client-side."""
+        """Get all trades (single fetch, client-side filter)."""
         query: Dict[str, str] = {}
         if params is not None:
             if hasattr(params, "to_dict"):
@@ -1045,11 +1148,22 @@ class ClobClient:
 
     def list_orders(self, market_id: Optional[str] = None, maker: Optional[str] = None,
                     status: Optional[str] = None, limit: Optional[int] = None) -> Any:
-        """List orders via /orders endpoint (richer filtering)."""
+        """List orders via /orders endpoint (richer filtering).
+
+        The server honours the ``maker`` filter; when no maker is supplied
+        the backend returns ``[]`` instead of treating the caller as the
+        maker.  To avoid a silently-empty result we default ``maker`` to
+        the signer's address when the client has one.  Pass
+        ``maker=""`` explicitly to opt out of this default.
+        """
+        # Fix 4: Default `maker` so callers aren't surprised by an empty list.
+        if maker is None and self._address:
+            maker = self._address
+
         params: Dict[str, str] = {}
         if market_id is not None:
             params["market_id"] = market_id
-        if maker is not None:
+        if maker:
             params["maker"] = maker
         if status is not None:
             params["status"] = status

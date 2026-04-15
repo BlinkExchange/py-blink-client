@@ -1,4 +1,10 @@
-"""Unit tests that don't need a running backend."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/tests/test_unit.py
+"""
+Unit tests for py-blink-client v2.
+
+Tests auth, signing, order builder, types, stubs, and hot path without
+requiring a running backend.
+"""
 import hashlib
 import json
 import os

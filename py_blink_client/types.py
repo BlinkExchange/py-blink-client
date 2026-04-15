@@ -1,10 +1,21 @@
-"""Dataclasses and payload structs for the Blink CLOB client."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/types.py
+"""
+Dataclasses and types for the Blink CLOB client.
+
+Polymarket-compatible: OrderArgs, OrderType, ApiCreds, OpenOrderParams,
+TradeParams, and OrderBookSummary match ``py-clob-client`` interfaces.
+
+Hot-path types (SignedOrder payload) use msgspec.Struct for fast serialization.
+API types use dataclasses for flexibility.
+"""
 from __future__ import annotations
 
 import msgspec
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
+
+from ._signing import canonical_token_id
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +60,15 @@ class OrderType:
 
 
 class SignatureType(IntEnum):
-    """On-chain signature type encoding (uint8)."""
+    """On-chain signature type encoding (uint8).
+
+    Only ``EOA`` is accepted by the Blink backend — the verifier rejects
+    all non-EOA sigs (see ``backend/src/api/verifier.rs``). POLY_1271 was
+    removed in the 2026-03-23 ZeroDev teardown; any historical references
+    in contract ABIs are contract-level permissiveness, not live support.
+    """
+    # Fix 6: Backend rejects POLY_1271 — keeping the enum value is a trap.
     EOA = 0
-    POLY_1271 = 3
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +129,8 @@ class OrderArgs:
 
     def __post_init__(self) -> None:
         self.side = str(self.side).upper()
+        if self.token_id:
+            self.token_id = canonical_token_id(self.token_id)
         self.validate()
 
     def validate(self) -> None:
@@ -142,6 +161,7 @@ class MarketOrderArgs:
         self.side = str(self.side).upper()
         if not self.token_id:
             raise ValueError("token_id is required")
+        self.token_id = canonical_token_id(self.token_id)
         if self.amount <= 0:
             raise ValueError(f"amount must be positive, got {self.amount}")
         if self.side not in ("BUY", "SELL"):
@@ -266,7 +286,7 @@ class SignedOrderPayload(msgspec.Struct):
     nonce: str
     feeRateBps: str
     side: str           # "BUY" or "SELL" string
-    signatureType: int  # 0=EOA, 3=POLY_1271
+    signatureType: int  # 0=EOA (only EOA is accepted by the backend verifier)
     signature: str
 
 
@@ -296,7 +316,7 @@ class SignedOrder:
     nonce: str = ""
     fee_rate_bps: str = ""
     side: int = 0  # SideInt value
-    signature_type: int = 0  # SignatureType value
+    signature_type: SignatureType = SignatureType.EOA
     signature: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -314,7 +334,7 @@ class SignedOrder:
             "nonce": self.nonce,
             "feeRateBps": self.fee_rate_bps,
             "side": side_str,
-            "signatureType": int(self.signature_type),
+            "signatureType": SignatureType(self.signature_type).value,
             "signature": self.signature,
         }
 
@@ -333,7 +353,7 @@ class SignedOrder:
             nonce=self.nonce,
             feeRateBps=self.fee_rate_bps,
             side=side_str,
-            signatureType=int(self.signature_type),
+            signatureType=SignatureType(self.signature_type).value,
             signature=self.signature,
         )
 
@@ -503,5 +523,56 @@ class BalanceAllowance:
         return cls(
             balance=str(d.get("balance", "0")),
             allowance=str(d.get("allowance", "0")),
+            raw=d,
+        )
+
+
+# Fix 5: Typed response — forward-compatible via `raw` escape hatch.
+@dataclass
+class MatchInfo:
+    """Single match entry inside a ``SubmitOrderResponse``.
+
+    The backend currently returns an empty list here (see
+    ``backend/src/api/handlers/orders.rs``); the typed shape is kept so
+    the SDK can surface matches once the backend starts populating them
+    without breaking existing consumers.
+    """
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "MatchInfo":
+        return cls(raw=d or {})
+
+
+@dataclass
+class SubmitOrderResponse:
+    """Typed response from ``POST /order`` and ``POST /orders``.
+
+    Mirrors the backend ``SubmitOrderResponse`` struct
+    (``backend/src/api/handlers/orders.rs``)::
+
+        { order_id: str, order_hash: str, status: str, matches: [MatchInfo] }
+
+    ``raw`` preserves the original dict for forward-compat when the
+    backend grows new fields.
+    """
+    order_id: str = ""
+    order_hash: str = ""
+    status: str = ""
+    matches: List[MatchInfo] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SubmitOrderResponse":
+        if not isinstance(d, dict):
+            # Defensive: backend returned something unexpected. Keep raw
+            # so the caller can inspect it.
+            return cls(raw={"_unexpected": d} if d is not None else {})
+        matches_raw = d.get("matches", []) or []
+        return cls(
+            order_id=str(d.get("order_id", "")),
+            order_hash=str(d.get("order_hash", "")),
+            status=str(d.get("status", "")),
+            matches=[MatchInfo.from_dict(m) for m in matches_raw if isinstance(m, dict)],
             raw=d,
         )

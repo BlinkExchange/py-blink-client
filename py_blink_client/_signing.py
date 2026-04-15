@@ -1,4 +1,11 @@
-"""EIP-712 order signing with a cached domain separator."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/_signing.py
+"""
+EIP-712 order signing with cached domain separator.
+
+``BlinkSigner`` caches the Account object, domain separator, and order type hash
+at init time so per-order signing is just: build struct hash + sign. With coincurve
+backing, this achieves sub-0.5ms per signature.
+"""
 from __future__ import annotations
 
 import logging
@@ -53,8 +60,36 @@ def _parse_token_id(value: Any) -> int:
     return int(s)
 
 
+def canonical_token_id(value: Any) -> str:
+    """Normalise a token_id to ``0x``-prefixed 64-char lowercase hex.
+
+    Accepts int, decimal string, bare hex, or ``0x``-prefixed hex (same
+    forms as ``_parse_token_id``). Used at the SDK boundary so caches
+    keyed by token_id don't end up with separate entries for
+    ``"abc..."`` / ``"0xabc..."`` / ``"12345"`` for the same token.
+
+    If parsing fails (malformed test fixture, typo), the input is
+    returned unchanged so the backend can produce a meaningful 400.
+    """
+    try:
+        return f"0x{_parse_token_id(value):064x}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
 class BlinkSigner:
-    """EIP-712 order signer. Caches the Account and domain separator."""
+    """EIP-712 order signer with cached domain separator.
+
+    Caches:
+      - ``Account`` object (avoids re-deriving EC key per sign)
+      - Domain separator (chain_id + exchange_address are constant)
+      - These make per-order signing sub-0.5ms with coincurve
+
+    Usage::
+
+        signer = BlinkSigner("0xprivate_key", 84532, "0xexchange_addr")
+        sig = signer.sign_order(order_data)
+    """
 
     def __init__(
         self,

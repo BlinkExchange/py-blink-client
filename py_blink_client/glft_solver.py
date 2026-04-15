@@ -38,6 +38,9 @@ def tqli(d: List[float], e: List[float], n: int, z: List[List[float]]) -> None:
     Modifies d (diagonal -> eigenvalues) and z (identity -> eigenvectors)
     in place.  e is the sub-diagonal and is destroyed.
 
+    Faithful port of the TypeScript implementation which itself is adapted
+    from Numerical Recipes / EISPACK.
+
     Args:
         d: Diagonal elements (length n). Overwritten with eigenvalues.
         e: Sub-diagonal elements (length n). Destroyed.

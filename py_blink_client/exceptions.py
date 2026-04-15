@@ -1,4 +1,7 @@
-"""Exceptions raised by the Blink CLOB client."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/exceptions.py
+"""
+Custom exceptions for the Blink CLOB client.
+"""
 
 
 class BlinkError(Exception):
@@ -44,4 +47,7 @@ class BlinkWebSocketError(BlinkError):
     """Raised on WebSocket-related errors."""
 
 
-PolyApiException = BlinkApiError  # py-clob-client compat alias
+# ---------------------------------------------------------------------------
+# Polymarket compatibility alias
+# ---------------------------------------------------------------------------
+PolyApiException = BlinkApiError

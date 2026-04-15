@@ -1,3 +1,4 @@
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/constants.py
 """
 Blink Markets CLOB client constants.
 
@@ -10,7 +11,7 @@ Contract addresses, endpoints, chain configuration, EIP-712 domains, and default
 BASE_SEPOLIA_CHAIN_ID = 84532
 
 # ---------------------------------------------------------------------------
-# Base Sepolia contract addresses
+# V3 contract addresses (Circle USDC, deployed 2026-03-31)
 # ---------------------------------------------------------------------------
 CONTRACTS = {
     "exchange": "0x6Eb5B3a29A5f20a5Cfed228c96037abeFa0deA2d",
@@ -81,6 +82,7 @@ DEFAULT_WS_URL = "wss://api.blink15.com"
 # ---------------------------------------------------------------------------
 EP_HEALTH = "/health"
 EP_HEALTH_READY = "/health/ready"
+EP_ADMIN_HEALTH_DETAILED = "/admin/health/detailed"
 EP_TIME = "/time"
 EP_MARKETS = "/markets"
 EP_MARKET = "/markets/"            # + {market_id}
@@ -104,7 +106,7 @@ EP_PRICE_HISTORY = "/prices/"      # + {token_id}/history
 EP_WALLET_STATUS = "/wallet-status"
 
 # ---------------------------------------------------------------------------
-# REST endpoints -- Faucet (public, no auth)
+# REST endpoints -- Faucet / gas-sponsorship (public, no auth)
 # ---------------------------------------------------------------------------
 EP_FAUCET_CLAIM = "/faucet/claim"
 EP_PERMIT = "/v1/permit"
@@ -114,6 +116,11 @@ EP_PREFUND_CTF_APPROVAL = "/v1/prefund-ctf-approval"
 # REST endpoints -- Balance (public, no auth)
 # ---------------------------------------------------------------------------
 EP_BALANCE_PUBLIC = "/v1/balance"
+
+# ---------------------------------------------------------------------------
+# REST endpoints -- Profile (Privy JWT auth)
+# ---------------------------------------------------------------------------
+EP_PROFILE = "/v1/profile"
 
 # ---------------------------------------------------------------------------
 # REST endpoints -- Auth (L1 EIP-712)

@@ -1,4 +1,13 @@
-"""HTTP transports: aiohttp (async) and httpx (sync)."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/_http.py
+"""
+HTTP transport layer.
+
+- ``BlinkHttpClient`` -- async, aiohttp-backed, separate trading + data pools.
+- ``BlinkSyncHttpClient`` -- sync, httpx-backed, single pool (fine for sync).
+
+Both implement retry (3 attempts, exponential backoff, 429 Retry-After),
+30s default timeout, and orjson for unstructured response parsing.
+"""
 from __future__ import annotations
 
 import asyncio

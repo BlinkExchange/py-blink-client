@@ -1,4 +1,17 @@
-"""Order amount computation and rounding."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/_order_builder.py
+"""
+Order amount computation and rounding.
+
+Handles conversion from human-readable price/size to raw 6-decimal
+makerAmount/takerAmount, with proper financial rounding using Decimal.
+
+Rounding rules (matching Polymarket):
+  - Price: rounded DOWN to tick size decimal places
+  - Size: rounded DOWN to 2 decimal places
+  - Amounts: use ROUNDING_CONFIG[tick_size].amount decimal places
+
+Market price calculation walks the orderbook for FOK/IOC fills.
+"""
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP

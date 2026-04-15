@@ -1,4 +1,14 @@
-"""L1 (EIP-712) and L2 (HMAC-SHA256) auth helpers."""
+# /home/shanmu/Documents/crypto/blink/py-blink-client/py_blink_client/_auth.py
+"""
+Authentication helpers for the Blink CLOB client.
+
+Two auth layers:
+  - L1 (EIP-712): Used for API-key creation/derivation. Signs a typed-data
+    message with the wallet's private key.
+  - L2 (HMAC-SHA256): Used for all authenticated REST calls after an API key
+    has been obtained. Signs ``timestamp + method + path + body`` with the
+    base64-encoded API secret.
+"""
 from __future__ import annotations
 
 import hashlib
